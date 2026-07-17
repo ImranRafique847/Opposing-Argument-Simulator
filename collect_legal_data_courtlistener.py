@@ -73,7 +73,7 @@ DAILY_REQUEST_BUDGET = 110         # stay under the real 125/day limit, leave a 
 REQUEST_DELAY_SECONDS = 3          # stay under 5/minute comfortably
 REQUEST_TIMEOUT_SECONDS = 60
 
-OUTPUT_CORPUS_JSONL = "legal_corpus_raw.jsonl"
+OUTPUT_CORPUS_JSONL = "legal_corpus_courtlistener_supplement.jsonl"  # supplement only — CAP corpus untouched
 BUDGET_FILE         = "request_budget.json"
 PROGRESS_FILE       = "collection_progress.json"  # tracks which keywords are already fully processed
 
