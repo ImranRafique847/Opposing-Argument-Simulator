@@ -1,39 +1,51 @@
 """
-Opposing-Argument Simulator — Phase 1: CAP Data Filter v2
+Opposing-Argument Simulator — Phase 1: CAP Data Filter v3
 -----------------------------------------------------------
-Reads the Illinois CAP dataset (text.data.jsonl.xz) directly.
-Uses whole-word regex matching (\bkeyword\b) to eliminate substring
-false positives like "released" matching "lease" or "lieutenant"
-matching "tenant".
+Reads CAP state parquet files and filters for landlord-tenant cases.
 
-Tighter filter rules (both must pass):
+Scope: New Mexico + California (multi-state)
+Source: free-law/Caselaw_Access_Project (HF gated dataset)
+        One parquet file per state: data_cal/cal.parquet, data_nm/nm.parquet
+
+Uses whole-word regex matching (\bkeyword\b) to eliminate substring
+false positives (e.g. "released" != "lease", "lieutenant" != "tenant").
+
+Filter rules (both must pass):
   1. At least one PRIMARY keyword matches as a whole word.
   2. Either:
      a. Primary keyword appears 3+ times (whole-word), OR
      b. At least 2 SUPPORT terms also appear as whole words.
 
-Output: legal_corpus_raw.jsonl with fields:
-  id, source, type, jurisdiction, case_type, citation, date, text
+Output: legal_corpus_final.jsonl
+  Fields: id, source, type, jurisdiction, case_type,
+          citation, date, text
+
+Run:
+    python filter_cap_data.py
 """
 
 import json
-import lzma
 import os
 import re
 import time
 from collections import Counter
 
+import pandas as pd
+
 # =========================================================
-# CONFIG
+# CONFIG — multi-state
 # =========================================================
 
-INPUT_FILE  = r"d:\Opposing-Argument Simulator\data\text.data.jsonl.xz"
-OUTPUT_FILE = r"d:\Opposing-Argument Simulator\legal_corpus_raw.jsonl"
+# Each entry: (parquet_path, state_name_for_jurisdiction_field)
+STATE_FILES = [
+    ("d:\\Opposing-Argument Simulator\\data_cal\\cal.parquet", "California"),
+    ("d:\\Opposing-Argument Simulator\\data_nm\\nm.parquet",   "New Mexico"),
+]
 
-TARGET_STATE    = "Illinois"
+OUTPUT_FILE     = "legal_corpus_final.jsonl"
 CASE_TYPE_LABEL = "tenancy"
 
-# Compile whole-word regex patterns for all keywords
+# Primary keywords — whole-word regex
 PRIMARY_KEYWORDS = ["landlord", "tenant", "eviction", "lease", "habitability"]
 SUPPORT_TERMS    = [
     "rent", "premises", "possession", "dispossess", "lessee",
@@ -42,10 +54,14 @@ SUPPORT_TERMS    = [
     "month-to-month", "tenancy",
 ]
 
-PRIMARY_PATTERNS = {kw: re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
-                    for kw in PRIMARY_KEYWORDS}
-SUPPORT_PATTERNS = {st: re.compile(r"\b" + re.escape(st) + r"\b", re.IGNORECASE)
-                    for st in SUPPORT_TERMS}
+PRIMARY_PATTERNS = {
+    kw: re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
+    for kw in PRIMARY_KEYWORDS
+}
+SUPPORT_PATTERNS = {
+    st: re.compile(r"\b" + re.escape(st) + r"\b", re.IGNORECASE)
+    for st in SUPPORT_TERMS
+}
 
 
 # =========================================================
@@ -53,215 +69,217 @@ SUPPORT_PATTERNS = {st: re.compile(r"\b" + re.escape(st) + r"\b", re.IGNORECASE)
 # =========================================================
 
 def primary_hit_count(text):
-    """Total whole-word hits across all primary keywords."""
     return sum(len(p.findall(text)) for p in PRIMARY_PATTERNS.values())
 
 def support_hit_count(text):
-    """Number of distinct support terms that appear as whole words."""
     return sum(1 for p in SUPPORT_PATTERNS.values() if p.search(text))
 
 def is_match(text):
-    """Return True only if the case genuinely discusses tenancy topics."""
-    # Must have at least one primary keyword as a whole word
-    primary_hits = primary_hit_count(text)
-    if primary_hits == 0:
+    hits = primary_hit_count(text)
+    if hits == 0:
         return False
-    # Strong signal: 3+ primary keyword hits
-    if primary_hits >= 3:
+    if hits >= 3:
         return True
-    # Moderate signal: any primary keyword + 2+ support terms
-    if support_hit_count(text) >= 2:
-        return True
-    return False
+    return support_hit_count(text) >= 2
 
 
 # =========================================================
-# EXTRACTION HELPERS
+# EXTRACTION HELPERS (handles both parquet and JSONL schemas)
 # =========================================================
 
-def extract_text(case):
-    casebody = case.get("casebody", {})
-    if isinstance(casebody, dict):
-        data = casebody.get("data", {})
-        if isinstance(data, dict):
-            opinions = data.get("opinions", [])
-            if opinions:
-                return "\n\n".join(op.get("text", "") for op in opinions if op.get("text"))
+def extract_text(row):
+    """Pull opinion text from a CAP parquet row."""
+    casebody = row.get("casebody") if isinstance(row, dict) else getattr(row, "casebody", None)
+    if casebody is not None:
+        # Parquet stores casebody as dict with data.opinions[].text
+        if isinstance(casebody, dict):
+            data = casebody.get("data", {})
+            if isinstance(data, dict):
+                opinions = data.get("opinions", [])
+                if opinions:
+                    return "\n\n".join(
+                        op.get("text", "") for op in opinions if op.get("text")
+                    )
+        # Some versions store it as a string
+        if isinstance(casebody, str):
+            return casebody
     return ""
 
-def extract_citation(case):
-    citations = case.get("citations", [])
-    if citations and isinstance(citations, list):
+def extract_citation(row):
+    citations = row.get("citations") if isinstance(row, dict) else getattr(row, "citations", None)
+    if citations and isinstance(citations, list) and len(citations) > 0:
         first = citations[0]
-        return first.get("cite", "") if isinstance(first, dict) else str(first)
+        if isinstance(first, dict):
+            return first.get("cite", "")
+        return str(first)
     return ""
 
 
 # =========================================================
-# MAIN FILTER PASS
+# PROCESS ONE STATE FILE
 # =========================================================
 
-def run_filter():
-    if not os.path.exists(INPUT_FILE):
-        raise SystemExit(f"ERROR: Input file not found: {INPUT_FILE}")
+def process_state(parquet_path, state_name, outfile):
+    if not os.path.exists(parquet_path):
+        print(f"  MISSING: {parquet_path} — skipping {state_name}")
+        print(f"  Download: huggingface_hub.hf_hub_download(")
+        print(f"      repo_id='free-law/Caselaw_Access_Project',")
+        print(f"      filename='{'cal' if 'cal' in parquet_path else 'nm'}/{'cal' if 'cal' in parquet_path else 'nm'}.parquet',")
+        print(f"      repo_type='dataset')")
+        return 0
 
-    print(f"Source: {INPUT_FILE}")
-    print(f"Filter: whole-word regex, primary keywords: {PRIMARY_KEYWORDS}")
-    print(f"Rule:   (>=3 primary hits) OR (>=1 primary + >=2 support terms)\n")
-
-    total_scanned = 0
-    total_matched = 0
+    print(f"\n{'='*60}")
+    print(f"Processing: {state_name}  ({parquet_path})")
     start = time.time()
 
-    if os.path.exists(OUTPUT_FILE):
-        os.remove(OUTPUT_FILE)
+    df = pd.read_parquet(parquet_path)
+    print(f"  Loaded {len(df):,} rows")
 
-    with lzma.open(INPUT_FILE, mode="rt", encoding="utf-8") as infile, \
-         open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
+    matched = 0
+    for _, row in df.iterrows():
+        text = extract_text(row)
+        if not text:
+            continue
+        if not is_match(text):
+            continue
 
-        for line in infile:
-            line = line.strip()
-            if not line:
-                continue
-            total_scanned += 1
+        citation = extract_citation(row)
+        record = {
+            "id":           row.get("id") if isinstance(row, dict) else getattr(row, "id", ""),
+            "source":       "CAP",
+            "type":         "case_law",
+            "jurisdiction": state_name,
+            "case_type":    CASE_TYPE_LABEL,
+            "citation":     citation,
+            "date":         row.get("decision_date") if isinstance(row, dict)
+                            else getattr(row, "decision_date", ""),
+            "text":         text,
+        }
+        outfile.write(json.dumps(record, ensure_ascii=False) + "\n")
+        matched += 1
 
-            try:
-                case = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            text = extract_text(case)
-            if not text:
-                continue
-
-            if not is_match(text):
-                continue
-
-            record = {
-                "id":           case.get("id", ""),
-                "source":       "CAP",
-                "type":         "case_law",
-                "jurisdiction": TARGET_STATE,
-                "case_type":    CASE_TYPE_LABEL,
-                "citation":     extract_citation(case),
-                "date":         case.get("decision_date", ""),
-                "text":         text,
-            }
-            outfile.write(json.dumps(record, ensure_ascii=False) + "\n")
-            total_matched += 1
-
-            if total_scanned % 20000 == 0:
-                print(f"  Scanned {total_scanned:,} | Matched {total_matched:,} ...")
+        if matched % 500 == 0:
+            print(f"  {matched:,} matched so far...")
 
     elapsed = time.time() - start
-    print(f"\nFilter done in {elapsed:.1f}s.")
-    print(f"Total scanned: {total_scanned:,}")
-    print(f"Total matched: {total_matched:,}")
-    print(f"Match rate:    {total_matched/total_scanned*100:.1f}%")
-    return total_matched
+    rate = len(df) / elapsed if elapsed > 0 else 0
+    print(f"  Done in {elapsed:.0f}s — {matched:,} / {len(df):,} records matched "
+          f"({matched/len(df)*100:.1f}%)")
+    return matched
 
 
 # =========================================================
 # VALIDATION
 # =========================================================
 
-def find_context(text, patterns, window=250):
-    """Find first whole-word match and return surrounding context."""
-    for kw, pat in patterns.items():
-        m = pat.search(text)
-        if m:
-            start = max(0, m.start() - window)
-            end   = min(len(text), m.end() + window)
-            snippet = text[start:end].replace("\n", " ")
-            rel = m.start() - start
-            rel_end = rel + len(m.group())
-            snippet = snippet[:rel] + "[" + snippet[rel:rel_end] + "]" + snippet[rel_end:]
-            return kw, "..." + snippet + "..."
-    return None, ""
+def validate(output_path):
+    print(f"\n{'='*60}")
+    print("VALIDATION")
+    print("="*60)
 
-def validate():
-    print("\n" + "=" * 70)
-    print("VALIDATION — 5 SAMPLE RECORDS WITH KEYWORD CONTEXT")
-    print("=" * 70)
+    if not os.path.exists(output_path):
+        print("Output file not found.")
+        return
 
-    with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    records_by_state = {}
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            state = rec.get("jurisdiction", "unknown")
+            records_by_state.setdefault(state, []).append(rec)
 
-    # Show records 1-5
-    for i, line in enumerate(lines[:5]):
-        rec = json.loads(line)
-        kw, ctx = find_context(rec["text"], PRIMARY_PATTERNS)
-        primary_hits = primary_hit_count(rec["text"])
-        support_hits = support_hit_count(rec["text"])
-        print(f"\nRecord {i+1}:")
-        print(f"  id:            {rec['id']}")
-        print(f"  citation:      {rec['citation']}")
-        print(f"  date:          {rec['date']}")
-        print(f"  primary hits:  {primary_hits}  |  support terms: {support_hits}")
-        print(f"  matched kw:    [{kw}]")
-        print(f"  context:       {ctx[:400]}")
+    print(f"\nRecord counts by state:")
+    total = 0
+    for state, recs in records_by_state.items():
+        print(f"  {state}: {len(recs):,}")
+        total += len(recs)
+    print(f"  TOTAL:  {total:,}")
 
-    # Check for burglary case specifically
-    print("\n" + "=" * 70)
-    print("BURGLARY CASE CHECK (id=2747110 should NOT be present)")
-    print("=" * 70)
-    found_burglary = any(json.loads(l).get("id") == 2747110 for l in lines)
-    print(f"  id=2747110 present: {found_burglary}  {'<-- PROBLEM' if found_burglary else '✓ REMOVED'}")
+    # Date sanity check per state
+    print(f"\nDate range per state:")
+    for state, recs in records_by_state.items():
+        years = []
+        bad = []
+        for r in recs:
+            d = str(r.get("date", ""))
+            if d and len(d) >= 4:
+                try:
+                    y = int(d[:4])
+                    years.append(y)
+                    if y < 1850:
+                        bad.append((r["id"], r["citation"], d))
+                except ValueError:
+                    pass
+        if years:
+            print(f"  {state}: {min(years)}–{max(years)}  "
+                  f"(suspicious pre-1850: {len(bad)})")
 
-    # Jurisdiction check
-    print("\n" + "=" * 70)
-    print("JURISDICTION + DATE DISTRIBUTION")
-    print("=" * 70)
-    dates = []
-    bad_dates = []
-    for line in lines:
-        rec = json.loads(line)
-        d = rec.get("date", "")
-        if d:
-            try:
-                year = int(str(d)[:4])
-                dates.append(year)
-                if year < 1820:  # Illinois became a state in 1818
-                    bad_dates.append((rec["id"], rec["citation"], d))
-            except ValueError:
-                pass
+    # 3 sample records per state with keyword context
+    def find_context(text, window=200):
+        for kw, pat in PRIMARY_PATTERNS.items():
+            m = pat.search(text)
+            if m:
+                s = max(0, m.start() - window)
+                e = min(len(text), m.end() + window)
+                snippet = text[s:e].replace("\n", " ")
+                rel = m.start() - s
+                rel_e = rel + len(m.group())
+                snippet = snippet[:rel] + "[" + snippet[rel:rel_e] + "]" + snippet[rel_e:]
+                return kw, "..." + snippet + "..."
+        return None, ""
 
-    print(f"  Total records: {len(lines):,}")
-    print(f"  Date range:    {min(dates)} — {max(dates)}")
-    print(f"  Pre-1820 dates (suspicious): {len(bad_dates)}")
-    for bid, bcite, bdate in bad_dates[:5]:
-        print(f"    id={bid}, citation={bcite}, date={bdate}")
+    print(f"\n3 sample records per state (citation traceability check):")
+    for state, recs in records_by_state.items():
+        print(f"\n--- {state} ---")
+        for i, rec in enumerate(recs[:3]):
+            kw, ctx = find_context(rec["text"])
+            hits = primary_hit_count(rec["text"])
+            print(f"\n  Sample {i+1}:")
+            print(f"    id:         {rec['id']}")
+            print(f"    citation:   {rec['citation']}")
+            print(f"    date:       {rec['date']}")
+            print(f"    kw_hits:    {hits}")
+            print(f"    context:    {ctx[:300]}")
 
-    decade_counts = Counter((y // 10) * 10 for y in dates)
-    print("\n  Decade distribution (top 12):")
-    for decade, count in sorted(decade_counts.items(), key=lambda x: -x[1])[:12]:
-        bar = "█" * (count // 50)
-        print(f"    {decade}s: {count:5,}  {bar}")
 
-    # Spot-check: show 3 records that scored highest on primary hits
-    print("\n" + "=" * 70)
-    print("TOP 3 RECORDS BY PRIMARY KEYWORD DENSITY (strongest signal)")
-    print("=" * 70)
-    scored = []
-    for line in lines:
-        rec = json.loads(line)
-        scored.append((primary_hit_count(rec["text"]), rec))
-    scored.sort(key=lambda x: -x[0])
-    for score, rec in scored[:3]:
-        kw, ctx = find_context(rec["text"], PRIMARY_PATTERNS)
-        print(f"\n  id={rec['id']} | citation={rec['citation']} | date={rec['date']}")
-        print(f"  primary keyword hits: {score}")
-        print(f"  context: {ctx[:350]}")
+# =========================================================
+# MAIN
+# =========================================================
 
-    print(f"\n\nPhase 1 validation complete. Final corpus: {len(lines):,} records.")
+def main():
     print(f"Output: {OUTPUT_FILE}")
+    print(f"States: {[s for _, s in STATE_FILES]}")
 
+    # Check which files are available
+    available = [(p, s) for p, s in STATE_FILES if os.path.exists(p)]
+    missing   = [(p, s) for p, s in STATE_FILES if not os.path.exists(p)]
 
-# =========================================================
-# RUN
-# =========================================================
+    if missing:
+        print(f"\nMISSING DATA FILES:")
+        for p, s in missing:
+            print(f"  {s}: {p}")
+        print(f"\nTo download (requires free-law/CAP gated access approval):")
+        print(f"  Run: python download_cap_states.py")
+        if not available:
+            print("\nNo state files available — nothing to process.")
+            return
+
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+
+    total_matched = 0
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
+        for parquet_path, state_name in STATE_FILES:
+            n = process_state(parquet_path, state_name, outfile)
+            total_matched += n
+
+    print(f"\nTotal records written: {total_matched:,} -> {OUTPUT_FILE}")
+
+    if total_matched > 0:
+        validate(OUTPUT_FILE)
+    else:
+        print("No records written — check data files and re-run once downloaded.")
+
 
 if __name__ == "__main__":
-    count = run_filter()
-    if count > 0:
-        validate()
+    main()

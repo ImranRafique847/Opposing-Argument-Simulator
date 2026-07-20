@@ -6,8 +6,19 @@ legal_corpus_raw.jsonl
 legal_corpus_final.jsonl
 legal_corpus_chunked.jsonl
 legal_corpus_courtlistener_supplement.jsonl
+chunked_corpus.jsonl
+embedded_chunks.jsonl
 cases_raw.parquet
 data/
+
+# Torch wheel (large binary)
+*.whl
+
+# Temp/runtime files
+*.tmp
+embed_progress.json
+request_budget.json
+collection_progress.json
 
 # Runtime state files
 request_budget.json

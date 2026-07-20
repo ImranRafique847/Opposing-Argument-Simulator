@@ -2,22 +2,35 @@
 Opposing-Argument Simulator — Phase 2, Step 1: Chunking
 ---------------------------------------------------------
 Reads legal_corpus_final.jsonl and splits each case opinion into
-overlapping chunks suitable for embedding and RAG retrieval.
+overlapping chunks for embedding and RAG retrieval.
 
-Chunking strategy:
-  1. Structure-aware: split on paragraph boundaries (\n\n) first,
-     then sentence/line boundaries (\n), then spaces — before ever
-     splitting mid-sentence. This keeps legal reasoning intact.
-  2. Target: 400 tokens per chunk (fits well within Titan V2's 8192
-     token limit while keeping enough context per chunk for retrieval).
-  3. Overlap: 60 tokens between consecutive chunks so a retrieval hit
-     near a chunk boundary doesn't lose surrounding context.
-  4. Each chunk carries full parent metadata: case id, citation, date,
-     jurisdiction — so every retrieved chunk is traceable to a real case.
+CITATION TRACEABILITY is the primary design constraint: every chunk
+carries enough metadata that any argument the LLM generates can be
+traced back to a specific, verifiable Illinois case citation.
 
-Output: legal_corpus_chunked.jsonl
-  Each line: {chunk_id, case_id, source, citation, date, jurisdiction,
-              case_type, chunk_index, total_chunks, token_count, text}
+Chunking strategy (in order of preference):
+  1. Split on paragraph boundaries (\n\n) — CAP OCR preserves paragraph
+     structure from the original opinion text.
+  2. For paragraphs exceeding the target size, split on SENTENCE BOUNDARIES
+     using NLTK's Punkt tokenizer — handles legal citations containing
+     periods (e.g. "2 Ill. App. 3d 538") correctly, unlike naive "." splits.
+  3. For sentences still exceeding the target, split on spaces (last resort).
+  4. 50-token overlap between consecutive chunks from the same case.
+  5. Discard chunks under 50 tokens (headers, lone citations, fragments).
+
+Output: chunked_corpus.jsonl
+  Fields per chunk:
+    chunk_id       — unique ID: "{case_id}_chunk_{index}"
+    source_case_id — original record's "id" field (for full traceability)
+    citation       — exact case citation string (e.g. "365 Ill. App. 3d 621")
+    jurisdiction   — always "Illinois"
+    case_type      — always "tenancy"
+    date           — decision date from source record
+    source         — always "CAP"
+    chunk_index    — 0-based position within the case
+    total_chunks   — total number of chunks for this case
+    token_count    — BPE token count of this chunk's text
+    text           — the chunk text itself
 
 Run:
     python chunk_corpus.py
@@ -25,156 +38,182 @@ Run:
 
 import json
 import os
-import re
 import time
+
+import nltk
 import tiktoken
+
+# Ensure NLTK sentence tokenizer data is available
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab", quiet=True)
 
 # =========================================================
 # CONFIG
 # =========================================================
 
 INPUT_FILE  = "legal_corpus_final.jsonl"
-OUTPUT_FILE = "legal_corpus_chunked.jsonl"
+OUTPUT_FILE = "chunked_corpus.jsonl"
 
-TARGET_TOKENS  = 400   # target chunk size in tokens
-OVERLAP_TOKENS = 60    # overlap between consecutive chunks
-MIN_TOKENS     = 50    # discard chunks shorter than this (boilerplate/headers)
+TARGET_TOKENS  = 400   # target chunk size (within 300-500 spec range)
+OVERLAP_TOKENS = 60    # overlap between consecutive chunks (within 50-75 spec)
+MIN_TOKENS     = 50    # discard chunks shorter than this
 
-# Tokeniser — cl100k_base is the GPT-4/Titan-compatible BPE tokeniser.
-# We use it purely for counting; the actual embedding tokenisation is
-# handled server-side by Bedrock.
+# cl100k_base matches Titan V2 / GPT-4 tokenisation closely enough for
+# size estimation. Actual tokenisation is done server-side by Bedrock.
 TOKENISER = tiktoken.get_encoding("cl100k_base")
 
-# Paragraph separators in priority order (try wider splits first)
-SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
-
 
 # =========================================================
-# TOKENISER HELPERS
+# TOKEN HELPERS
 # =========================================================
 
-def count_tokens(text):
+def count_tokens(text: str) -> int:
     return len(TOKENISER.encode(text))
 
-def tokens_to_text(tokens):
-    return TOKENISER.decode(tokens)
-
-def text_to_tokens(text):
+def encode(text: str) -> list:
     return TOKENISER.encode(text)
 
+def decode(tokens: list) -> str:
+    return TOKENISER.decode(tokens)
+
 
 # =========================================================
-# RECURSIVE CHARACTER SPLITTER
+# SENTENCE SPLITTER (NLTK-based, citation-safe)
 # =========================================================
 
-def recursive_split(text, separators, target, overlap):
+def split_sentences(text: str) -> list[str]:
     """
-    Split text recursively on separator hierarchy.
-    Returns a list of strings, each ~target tokens with ~overlap token overlap.
+    Split text into sentences using NLTK Punkt tokenizer.
+    Correctly handles legal citations like "2 Ill. App. 3d 538"
+    without treating abbreviation periods as sentence boundaries.
     """
-    # Try each separator in order
-    for sep in separators:
-        if sep == "":
-            # Last resort: split on token boundary directly
-            parts = [text]
-        else:
-            parts = text.split(sep)
+    sentences = nltk.sent_tokenize(text)
+    return [s.strip() for s in sentences if s.strip()]
 
-        if len(parts) > 1:
-            break
 
-    if len(parts) == 1:
-        # Can't split further — return as-is even if oversized
-        return [text] if count_tokens(text) >= MIN_TOKENS else []
+# =========================================================
+# CORE CHUNKER
+# =========================================================
 
-    # Merge small parts into target-sized chunks with overlap
+def make_chunks_with_overlap(units: list[str], target: int, overlap: int) -> list[str]:
+    """
+    Given a list of text units (paragraphs or sentences), pack them into
+    chunks of ~target tokens with ~overlap token overlap between chunks.
+    """
     chunks = []
+    current_units = []
     current_tokens = []
-    current_text_parts = []
 
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
+    for unit in units:
+        unit_toks = encode(unit)
 
-        part_tokens = text_to_tokens(part)
-
-        # If this single part is larger than target, recurse into it
-        if len(part_tokens) > target:
+        # Single unit too large for target — split it on spaces as last resort
+        if len(unit_toks) > target:
             # Flush current buffer first
-            if current_tokens:
-                chunk_text = (sep if sep else " ").join(current_text_parts)
+            if current_units:
+                chunk_text = " ".join(current_units)
                 if count_tokens(chunk_text) >= MIN_TOKENS:
                     chunks.append(chunk_text)
+                # Seed overlap from tail of current buffer
+                overlap_text = decode(current_tokens[-overlap:]).strip() if overlap else ""
+                current_units = [overlap_text] if overlap_text else []
                 current_tokens = current_tokens[-overlap:] if overlap else []
-                current_text_parts = []
 
-            sub_chunks = recursive_split(
-                part,
-                separators[separators.index(sep) + 1:] if sep in separators[1:] else separators[1:],
-                target,
-                overlap,
-            )
-            chunks.extend(sub_chunks)
+            # Split oversized unit on spaces
+            words = unit.split(" ")
+            word_buffer = []
+            word_toks = []
+            for word in words:
+                w_toks = encode(word + " ")
+                if len(word_toks) + len(w_toks) > target and word_buffer:
+                    chunk_text = " ".join(word_buffer)
+                    if count_tokens(chunk_text) >= MIN_TOKENS:
+                        chunks.append(chunk_text)
+                    overlap_text = decode(word_toks[-overlap:]).strip() if overlap else ""
+                    word_buffer = [overlap_text] if overlap_text else []
+                    word_toks = word_toks[-overlap:] if overlap else []
+                word_buffer.append(word)
+                word_toks.extend(w_toks)
+            if word_buffer:
+                chunk_text = " ".join(word_buffer)
+                if count_tokens(chunk_text) >= MIN_TOKENS:
+                    current_units = [chunk_text]
+                    current_tokens = encode(chunk_text)
             continue
 
-        # Would adding this part exceed the target?
-        if len(current_tokens) + len(part_tokens) > target and current_tokens:
-            # Emit current chunk
-            chunk_text = (sep if sep else " ").join(current_text_parts)
+        # Adding this unit would exceed target — emit current chunk first
+        if len(current_tokens) + len(unit_toks) > target and current_units:
+            chunk_text = " ".join(current_units)
             if count_tokens(chunk_text) >= MIN_TOKENS:
                 chunks.append(chunk_text)
+            # Overlap: seed next chunk with tail tokens of what we just emitted
+            overlap_toks = current_tokens[-overlap:] if overlap else []
+            overlap_text = decode(overlap_toks).strip() if overlap_toks else ""
+            current_units = [overlap_text] if overlap_text else []
+            current_tokens = list(overlap_toks)
 
-            # Seed the next chunk with the overlap window
-            # (keep last N tokens worth of parts)
-            overlap_tokens = current_tokens[-overlap:] if overlap else []
-            overlap_text = tokens_to_text(overlap_tokens).strip()
-            current_tokens = list(overlap_tokens)
-            current_text_parts = [overlap_text] if overlap_text else []
-
-        current_tokens.extend(part_tokens)
-        current_text_parts.append(part)
+        current_units.append(unit)
+        current_tokens.extend(unit_toks)
 
     # Flush remainder
-    if current_text_parts:
-        chunk_text = (sep if sep else " ").join(current_text_parts)
+    if current_units:
+        chunk_text = " ".join(current_units)
         if count_tokens(chunk_text) >= MIN_TOKENS:
             chunks.append(chunk_text)
 
     return chunks
 
 
-# =========================================================
-# CHUNK A SINGLE CASE
-# =========================================================
-
-def chunk_case(record):
-    """Split one case record into overlapping chunks with metadata."""
+def chunk_case(record: dict) -> list[dict]:
+    """
+    Split one case record into overlapping, metadata-tagged chunks.
+    Strategy: paragraph split → sentence split within large paragraphs →
+    space split as last resort.
+    """
     text = record.get("text", "").strip()
     if not text:
         return []
 
-    raw_chunks = recursive_split(text, SEPARATORS, TARGET_TOKENS, OVERLAP_TOKENS)
+    # ── Step 1: paragraph split ──────────────────────────────────────────
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
 
+    # ── Step 2: sentence-split any paragraph exceeding the target ────────
+    units = []
+    for para in paragraphs:
+        if count_tokens(para) <= TARGET_TOKENS:
+            units.append(para)
+        else:
+            # Use NLTK sentence tokenizer (citation-safe)
+            sentences = split_sentences(para)
+            units.extend(sentences if sentences else [para])
+
+    # ── Step 3: pack units into overlapping chunks ────────────────────────
+    raw_chunks = make_chunks_with_overlap(units, TARGET_TOKENS, OVERLAP_TOKENS)
+
+    if not raw_chunks:
+        return []
+
+    # ── Step 4: attach metadata to every chunk ────────────────────────────
     chunks = []
+    n = len(raw_chunks)
     for i, chunk_text in enumerate(raw_chunks):
         chunks.append({
-            "chunk_id":     f"{record['id']}_chunk_{i}",
-            "case_id":      record["id"],
-            "source":       record.get("source", "CAP"),
-            "citation":     record.get("citation", ""),
-            "date":         record.get("date", ""),
-            "jurisdiction": record.get("jurisdiction", "Illinois"),
-            "case_type":    record.get("case_type", "tenancy"),
-            "chunk_index":  i,
-            "total_chunks": len(raw_chunks),   # updated after loop below
-            "token_count":  count_tokens(chunk_text),
-            "text":         chunk_text,
+            "chunk_id":       f"{record['id']}_chunk_{i}",
+            "source_case_id": record["id"],          # traceability anchor
+            "citation":       record.get("citation", ""),
+            "jurisdiction":   record.get("jurisdiction", "Illinois"),
+            "case_type":      record.get("case_type", "tenancy"),
+            "date":           record.get("date", ""),
+            "source":         record.get("source", "CAP"),
+            "chunk_index":    i,
+            "total_chunks":   n,
+            "token_count":    count_tokens(chunk_text),
+            "text":           chunk_text,
         })
-
-    # Back-fill total_chunks now we know the real count
-    for c in chunks:
-        c["total_chunks"] = len(chunks)
 
     return chunks
 
@@ -187,15 +226,14 @@ def main():
     if not os.path.exists(INPUT_FILE):
         raise SystemExit(f"ERROR: {INPUT_FILE} not found.")
 
-    print(f"Input:  {INPUT_FILE}")
-    print(f"Output: {OUTPUT_FILE}")
-    print(f"Target: {TARGET_TOKENS} tokens/chunk, {OVERLAP_TOKENS} token overlap\n")
+    print(f"Input:   {INPUT_FILE}")
+    print(f"Output:  {OUTPUT_FILE}")
+    print(f"Target:  {TARGET_TOKENS} tokens/chunk  |  Overlap: {OVERLAP_TOKENS}  |  Min: {MIN_TOKENS}\n")
 
     start = time.time()
-
-    total_cases   = 0
-    total_chunks  = 0
-    token_counts  = []
+    total_cases  = 0
+    total_chunks = 0
+    token_counts = []
 
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
@@ -207,7 +245,6 @@ def main():
             line = line.strip()
             if not line:
                 continue
-
             record = json.loads(line)
             chunks = chunk_case(record)
 
@@ -219,51 +256,60 @@ def main():
             total_chunks += len(chunks)
 
             if total_cases % 1000 == 0:
-                print(f"  Processed {total_cases:,} cases | {total_chunks:,} chunks so far...")
+                print(f"  {total_cases:,} cases | {total_chunks:,} chunks...")
 
     elapsed = time.time() - start
-
-    avg_tokens = sum(token_counts) / len(token_counts) if token_counts else 0
-    min_tokens = min(token_counts) if token_counts else 0
-    max_tokens = max(token_counts) if token_counts else 0
-
-    # Token distribution buckets
-    buckets = {"<100": 0, "100-200": 0, "200-300": 0, "300-400": 0,
-               "400-500": 0, "500+": 0}
+    avg  = sum(token_counts) / len(token_counts) if token_counts else 0
+    buckets = {"<100": 0, "100-200": 0, "200-300": 0,
+               "300-400": 0, "400-500": 0, "500+": 0}
     for t in token_counts:
-        if t < 100:        buckets["<100"]     += 1
-        elif t < 200:      buckets["100-200"]  += 1
-        elif t < 300:      buckets["200-300"]  += 1
-        elif t < 400:      buckets["300-400"]  += 1
-        elif t < 500:      buckets["400-500"]  += 1
-        else:              buckets["500+"]     += 1
+        if   t < 100: buckets["<100"]     += 1
+        elif t < 200: buckets["100-200"]  += 1
+        elif t < 300: buckets["200-300"]  += 1
+        elif t < 400: buckets["300-400"]  += 1
+        elif t < 500: buckets["400-500"]  += 1
+        else:         buckets["500+"]     += 1
 
-    print(f"\nDone in {elapsed:.1f}s.")
-    print(f"Cases processed:  {total_cases:,}")
-    print(f"Total chunks:     {total_chunks:,}")
-    print(f"Avg chunks/case:  {total_chunks/total_cases:.1f}")
-    print(f"\nToken distribution per chunk:")
-    print(f"  Min: {min_tokens}  |  Avg: {avg_tokens:.0f}  |  Max: {max_tokens}")
+    print(f"\nDone in {elapsed:.1f}s")
+    print(f"Cases:          {total_cases:,}")
+    print(f"Total chunks:   {total_chunks:,}")
+    print(f"Avg/case:       {total_chunks/total_cases:.1f}")
+    print(f"Token stats:    min={min(token_counts)}  avg={avg:.0f}  max={max(token_counts)}")
+    print(f"\nToken distribution:")
     for bucket, count in buckets.items():
-        bar = "█" * (count // 100)
-        print(f"  {bucket:>8} tokens: {count:6,}  {bar}")
+        bar = "█" * (count // 200)
+        print(f"  {bucket:>9}: {count:6,}  {bar}")
 
-    # Show 2 sample chunks for sanity check
-    print(f"\nSample chunks (first 2 from output):")
+    # ── Show 3 full sample chunks for citation traceability review ────────
+    print(f"\n{'='*65}")
+    print("SAMPLE CHUNKS — verify citation traceability")
+    print("='*65")
     with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i >= 2:
-                break
+        samples = []
+        # Grab chunks from 3 different cases for diversity
+        seen_cases = set()
+        for line in f:
             c = json.loads(line)
-            print(f"\n  chunk_id:    {c['chunk_id']}")
-            print(f"  citation:    {c['citation']}")
-            print(f"  date:        {c['date']}")
-            print(f"  chunk_index: {c['chunk_index']} / {c['total_chunks']-1}")
-            print(f"  token_count: {c['token_count']}")
-            print(f"  text[:200]:  {c['text'][:200]}...")
+            if c["source_case_id"] not in seen_cases:
+                samples.append(c)
+                seen_cases.add(c["source_case_id"])
+            if len(samples) == 3:
+                break
 
-    print(f"\nOutput written: {OUTPUT_FILE}")
-    print(f"Next step: embed chunks with Amazon Titan Text Embeddings V2 via Bedrock.")
+    for s in samples:
+        print(f"\nchunk_id:       {s['chunk_id']}")
+        print(f"source_case_id: {s['source_case_id']}")
+        print(f"citation:       {s['citation']}")
+        print(f"jurisdiction:   {s['jurisdiction']}")
+        print(f"case_type:      {s['case_type']}")
+        print(f"date:           {s['date']}")
+        print(f"chunk_index:    {s['chunk_index']} of {s['total_chunks']-1}")
+        print(f"token_count:    {s['token_count']}")
+        print(f"text:\n  {s['text'][:500]}{'...' if len(s['text'])>500 else ''}")
+        print()
+
+    print(f"Output: {OUTPUT_FILE}  ({total_chunks:,} chunks)")
+    print("Awaiting review before proceeding to embedding.")
 
 
 if __name__ == "__main__":
