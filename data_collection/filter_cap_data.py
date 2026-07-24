@@ -1,11 +1,13 @@
 """
-Opposing-Argument Simulator — Phase 1: CAP Data Filter v3
------------------------------------------------------------
-Reads CAP state parquet files and filters for landlord-tenant cases.
+Opposing-Argument Simulator — Phase 1: CAP Data Filter
+--------------------------------------------------------
+Reads the Illinois CAP dataset downloaded from Kaggle
+(harvardlil/caselaw-dataset-illinois) and filters for
+landlord-tenant cases using whole-word keyword matching.
 
-Scope: New Mexico + California (multi-state)
-Source: free-law/Caselaw_Access_Project (HF gated dataset)
-        One parquet file per state: data_cal/cal.parquet, data_nm/nm.parquet
+Source: Harvard Caselaw Access Project (CAP) — Illinois bulk file
+        Downloaded via: kaggle datasets download -d harvardlil/caselaw-dataset-illinois -p data --unzip
+        Input files: data/text.data.jsonl.xz
 
 Uses whole-word regex matching (\bkeyword\b) to eliminate substring
 false positives (e.g. "released" != "lease", "lieutenant" != "tenant").
@@ -20,8 +22,11 @@ Output: legal_corpus_final.jsonl
   Fields: id, source, type, jurisdiction, case_type,
           citation, date, text
 
+Result: 9,408 clean Illinois landlord-tenant cases from
+        183,149 total Illinois cases (5.1% match rate)
+
 Run:
-    python filter_cap_data.py
+    python data_collection/filter_cap_data.py
 """
 
 import json
@@ -33,17 +38,17 @@ from collections import Counter
 import pandas as pd
 
 # =========================================================
-# CONFIG — multi-state
+# CONFIG — Illinois (Kaggle CAP bulk download)
 # =========================================================
 
-# Each entry: (parquet_path, state_name_for_jurisdiction_field)
-STATE_FILES = [
-    ("d:\\Opposing-Argument Simulator\\data_cal\\cal.parquet", "California"),
-    ("d:\\Opposing-Argument Simulator\\data_nm\\nm.parquet",   "New Mexico"),
-]
+# Illinois CAP data downloaded from Kaggle:
+# kaggle datasets download -d harvardlil/caselaw-dataset-illinois -p data --unzip
+# The downloaded file is: data/text.data.jsonl.xz
+import lzma
 
-OUTPUT_FILE     = "legal_corpus_final.jsonl"
-CASE_TYPE_LABEL = "tenancy"
+INPUT_XZ_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "text.data.jsonl.xz")
+OUTPUT_FILE   = "legal_corpus_final.jsonl"
+TARGET_STATE  = "Illinois"
 
 # Primary keywords — whole-word regex
 PRIMARY_KEYWORDS = ["landlord", "tenant", "eviction", "lease", "habitability"]

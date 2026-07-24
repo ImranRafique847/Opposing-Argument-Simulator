@@ -10,6 +10,8 @@ chunked_corpus.jsonl
 embedded_chunks.jsonl
 cases_raw.parquet
 data/
+data_cal/
+data_nm/
 
 # Torch wheel (large binary)
 *.whl

@@ -1,3 +1,4 @@
+# Phase 1 — Data collection
 datasets==5.0.0
 huggingface_hub==1.23.0
 pandas==3.0.3
@@ -6,3 +7,20 @@ tqdm==4.68.4
 python-dotenv==1.2.2
 hf_transfer==0.1.9
 kaggle
+nltk
+
+# Phase 2 — Chunking, embedding, vector DB
+tiktoken
+sentence-transformers
+rank_bm25
+psycopg2-binary
+boto3
+
+# Phase 3 — UI
+streamlit
+
+# Note: torch (GPU) must be installed separately depending on your CUDA version.
+# For CUDA 12.8 / Python 3.14 (nightly):
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+# For CPU-only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
